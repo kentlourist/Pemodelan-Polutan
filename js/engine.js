@@ -38,29 +38,46 @@ export function plumePoint(Q, H, u, cls, urban, xd, yc, kLoss) {
   return c * 1e6 * deplete;                         // g/m3 -> ug/m3
 }
 
-// ---------- Level 5a: Air Dispersion Solver ----------
-export function solveAir({ sumber, polutan, u, dirFrom, cls, urban, kLoss, luasM, n, background = 0 }) {
-  const to = ((dirFrom + 180) % 360) * Math.PI / 180;
-  const sx = Math.sin(to), cy = Math.cos(to);
-  const grid = new Float32Array(n * n);
+// ---------- Level 5a: Air Dispersion Solver (3D, dengan koreksi terrain) ----------
+// Medan konsentrasi 3D. z = tinggi di atas permukaan tanah lokal. Latar belakang TIDAK termasuk.
+// Koreksi terrain (gaya ISC): tinggi plume di atas tanah dikurangi f*(z_tanah - z_sumber),
+// f = 0.5 (kelas A–D), f = 1 (kelas E–F: plume stabil tidak naik mengikuti lereng), minimum 10 m.
+export function airField({ sumber, polutan, u, dirFrom, cls, urban, kLoss, dem = null, topo = false }) {
+  const to = ((dirFrom + 180) % 360) * Math.PI / 180, sx = Math.sin(to), cy = Math.cos(to);
+  const f = (cls === 'E' || cls === 'F') ? 1 : 0.5;
+  const eff = sumber.map(s => ({ s, H: s.H + plumeRise(s, u, cls), Q: s.Q[polutan], z0: dem ? dem(s.e, s.n) : 0 }));
+  return { eff, sx, cy, u, cls, urban,
+    hLocal(H, zt, z0) { return topo && dem ? Math.max(10, H - f * (zt - z0)) : H; },
+    c(E, N, z = 0, zt = null) {
+      if (zt === null) zt = dem ? dem(E, N) : 0;
+      let c = 0;
+      for (const { s, H, Q, z0 } of eff) {
+        const re = E - s.e, rn = N - s.n, xd = re * sx + rn * cy;
+        if (xd <= 10) continue;
+        const yc = re * cy - rn * sx, [sy, sz] = sigma(cls, xd, urban), Hl = this.hLocal(H, zt, z0);
+        c += Q / (2 * Math.PI * u * sy * sz) * Math.exp(-yc * yc / (2 * sy * sy))
+           * (Math.exp(-((z - Hl) ** 2) / (2 * sz * sz)) + Math.exp(-((z + Hl) ** 2) / (2 * sz * sz)))
+           * 1e6 * Math.exp(-kLoss * xd / u);
+      }
+      return c;
+    } };
+}
+
+export function solveAir({ sumber, polutan, u, dirFrom, cls, urban, kLoss, luasM, n, background = 0, dem = null, topo = false }) {
+  const field = airField({ sumber, polutan, u, dirFrom, cls, urban, kLoss, dem, topo });
+  const grid = new Float32Array(n * n), demGrid = new Float32Array(n * n);
   const half = luasM / 2, dx = luasM / n;
-  const eff = sumber.map(s => ({ s, H: s.H + plumeRise(s, u, cls), Q: s.Q[polutan] }));
   let max = 0;
   for (let j = 0; j < n; j++) {
     const N = half - (j + .5) * dx;                 // baris 0 = utara
     for (let i = 0; i < n; i++) {
-      const E = -half + (i + .5) * dx;
-      let c = 0;
-      for (const { s, H, Q } of eff) {
-        const re = E - s.e, rn = N - s.n;
-        c += plumePoint(Q, H, u, cls, urban, re * sx + rn * cy, re * cy - rn * sx, kLoss);
-      }
-      c += background;
-      grid[j * n + i] = c;
+      const E = -half + (i + .5) * dx, zt = dem ? dem(E, N) : 0;
+      const c = field.c(E, N, 0, zt) + background;
+      grid[j * n + i] = c; demGrid[j * n + i] = zt;
       if (c > max) max = c;
     }
   }
-  return { grid, n, max, luasM, dx, plume: eff.map(e => e.H) };
+  return { grid, n, max, luasM, dx, plume: field.eff.map(e => e.H), field, dem: demGrid };
 }
 
 export function sampleGrid(res, e, nn) {
@@ -70,43 +87,44 @@ export function sampleGrid(res, e, nn) {
   return res.grid[j * res.n + i];
 }
 
-// ---------- Level 5b: Groundwater Transport Solver (FDM, ADR, upwind + koreksi dispersi numerik) ----------
+// ---------- Level 5b: Groundwater Transport Solver (FDM, ADR) ----------
+// Grid nx x ny (ny, dy opsional). Dipakai untuk denah 2D (x–y) dan penampang vertikal (x–z):
+// pada penampang, sumbu "y" adalah kedalaman dan vDown adalah laju infiltrasi/pelindian ke bawah (m/hari).
 export function solveGW(p) {
   const { n, luasM, K, grad, ne, aL, rhoB, Kd, lambda, arah, C0, hari, nSnap = 24, sourceMask, probes = [] } = p;
-  const dx = luasM / n;
-  const v = K * grad / ne;                          // m/hari (Darcy: q = K i, v = q/ne)
-  const th = arah * Math.PI / 180;                  // arah aliran menuju (derajat dari utara)
-  const vx = v * Math.sin(th), vy = v * Math.cos(th); // vy positif = utara
-  const R = 1 + rhoB * Kd / ne;
-  const Dm = 1e-4;                                  // difusi molekuler efektif (m2/hari)
-  const Dx = Math.max(aL * Math.abs(v) * Math.abs(Math.sin(th)) + aL / 10 * Math.abs(v) * Math.abs(Math.cos(th)) + Dm - Math.abs(vx) * dx / 2, 0);
-  const Dy = Math.max(aL / 10 * Math.abs(v) * Math.abs(Math.sin(th)) + aL * Math.abs(v) * Math.abs(Math.cos(th)) + Dm - Math.abs(vy) * dx / 2, 0);
-  const dt = 0.45 / ((Math.abs(vx) + Math.abs(vy)) / (dx * R) + 2 * (Dx + Dy) / (dx * dx * R) + lambda);
+  const nx = n, ny = p.ny || n, dx = luasM / nx, dy = p.dy || dx, aT = p.aT ?? aL / 10, vDown = p.vDown || 0;
+  const v = K * grad / ne, th = arah * Math.PI / 180;   // Darcy: q = K i, v = q / ne
+  const vx = v * Math.sin(th), vy = v * Math.cos(th) - vDown;   // vy positif = ke utara (atas)
+  const vm = Math.hypot(vx, vy) || 1, R = 1 + rhoB * Kd / ne, Dm = 1e-4;
+  const Dx = Math.max((aL * vx * vx + aT * vy * vy) / vm + Dm - Math.abs(vx) * dx / 2, 0);   // koreksi dispersi numerik upwind
+  const Dy = Math.max((aL * vy * vy + aT * vx * vx) / vm + Dm - Math.abs(vy) * dy / 2, 0);
+  const dt = 0.45 / ((Math.abs(vx) / dx + Math.abs(vy) / dy) / R + 2 * (Dx / (dx * dx) + Dy / (dy * dy)) / R + lambda);
   const steps = Math.ceil(hari / dt), every = Math.max(1, Math.floor(steps / nSnap));
-  let c = new Float64Array(n * n), c2 = new Float64Array(n * n);
-  const mask = new Uint8Array(n * n);
-  for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) mask[j * n + i] = sourceMask(i, j) ? 1 : 0;
+  let c = new Float64Array(nx * ny), c2 = new Float64Array(nx * ny);
+  const mask = new Uint8Array(nx * ny);
+  for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) mask[j * nx + i] = sourceMask(i, j) ? 1 : 0;
   const snaps = [], series = probes.map(() => []);
-  const cell = (e, nn) => { const h = luasM / 2; return [Math.floor((e + h) / dx), Math.floor((h - nn) / dx)]; };
+  const hx = luasM / 2, hy = ny * dy / 2;
+  const cell = (e, nn) => [Math.floor((e + hx) / dx), Math.floor((hy - nn) / dy)];
   for (let k = 0; k <= steps; k++) {
     if (k % every === 0 || k === steps) {
       snaps.push({ t: k * dt, grid: Float32Array.from(c) });
-      probes.forEach((pr, q) => { const [i, j] = cell(pr.e, pr.n); series[q].push(c[j * n + i]); });
+      probes.forEach((pr, q) => { const [i, j] = cell(pr.e, pr.n); series[q].push(c[j * nx + i]); });
     }
     if (k === steps) break;
-    for (let j = 1; j < n - 1; j++) for (let i = 1; i < n - 1; i++) {
-      const id = j * n + i, cc = c[id];
+    for (let j = 1; j < ny - 1; j++) for (let i = 1; i < nx - 1; i++) {
+      const id = j * nx + i, cc = c[id];
       const adv = (vx >= 0 ? vx * (cc - c[id - 1]) : vx * (c[id + 1] - cc)) / dx
-                + (vy >= 0 ? vy * (cc - c[id + n]) : vy * (c[id - n] - cc)) / dx; // j+1 = selatan
-      const dif = Dx * (c[id + 1] - 2 * cc + c[id - 1]) / (dx * dx) + Dy * (c[id + n] - 2 * cc + c[id - n]) / (dx * dx);
+                + (vy >= 0 ? vy * (cc - c[id + nx]) : vy * (c[id - nx] - cc)) / dy;   // j+1 = selatan/bawah
+      const dif = Dx * (c[id + 1] - 2 * cc + c[id - 1]) / (dx * dx) + Dy * (c[id + nx] - 2 * cc + c[id - nx]) / (dy * dy);
       c2[id] = cc + dt * ((dif - adv) / R - lambda * cc);
     }
-    for (let id = 0; id < n * n; id++) if (mask[id]) c2[id] = C0;
-    // batas terbuka: salin tetangga
-    for (let a = 0; a < n; a++) { c2[a] = c2[a + n]; c2[(n - 1) * n + a] = c2[(n - 2) * n + a]; c2[a * n] = c2[a * n + 1]; c2[a * n + n - 1] = c2[a * n + n - 2]; }
+    for (let id = 0; id < nx * ny; id++) if (mask[id]) c2[id] = C0;
+    for (let a = 0; a < nx; a++) { c2[a] = c2[a + nx]; c2[(ny - 1) * nx + a] = c2[(ny - 2) * nx + a]; }
+    for (let b = 0; b < ny; b++) { c2[b * nx] = c2[b * nx + 1]; c2[b * nx + nx - 1] = c2[b * nx + nx - 2]; }
     [c, c2] = [c2, c];
   }
-  return { n, luasM, dx, v, R, Dx, Dy, dt, snaps, series, hari, probes };
+  return { n: nx, nx, ny, dx, dy, luasM, v, R, Dx, Dy, dt, snaps, series, hari, probes };
 }
 
 // ---------- Level 7/8: kepatuhan baku mutu & risiko ----------

@@ -67,3 +67,16 @@ export const BASEMAPS = {
   'OpenStreetMap': { url: 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', sub: 'abc', attr: '© OpenStreetMap' },
   'Esri Satelit': { url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', sub: 'abc', attr: '© Esri' },
 };
+
+// DEM DEMO (sintetis) untuk efek topografi. Elevasi (m) pada koordinat lokal (e, n) dalam meter dari pusat.
+// Ganti fungsi ini dengan pembacaan DEM nyata (mis. hasil ekspor GEE atau tile Terrarium) bila diperlukan.
+// Catatan: tile Google Terrain hanyalah gambar peta berarsir, bukan data elevasi, sehingga tidak dapat dibaca nilainya.
+const BUKIT = [
+  { e: 3600, n: 500, h: 220, s: 900 }, { e: 6200, n: -1200, h: 300, s: 1200 },
+  { e: -3500, n: -1500, h: 150, s: 1100 }, { e: 1800, n: -2800, h: 90, s: 700 }, { e: -1500, n: 3500, h: 120, s: 900 },
+];
+export function elevUdara(e, n) {
+  let z = 12 + 0.0006 * e;
+  for (const b of BUKIT) z += b.h * Math.exp(-((e - b.e) ** 2 + (n - b.n) ** 2) / (2 * b.s * b.s));
+  return z;
+}

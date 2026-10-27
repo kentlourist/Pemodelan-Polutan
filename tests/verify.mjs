@@ -1,5 +1,5 @@
 // Level 6 – Verifikasi: solver dibandingkan dengan solusi analitik.
-import { solveGW, plumePoint, sigma } from '../js/engine.js';
+import { solveGW, plumePoint, sigma, airField } from '../js/engine.js';
 
 function erfc(x) { // Abramowitz–Stegun 7.1.26 (|err| < 1.5e-7)
   const s = x < 0 ? -1 : 1, z = Math.abs(x), t = 1 / (1 + 0.3275911 * z);
@@ -44,5 +44,18 @@ const cek = (nama, ok, info) => { console.log(`${ok ? 'LULUS' : 'GAGAL'}  ${nama
   // integral lateral * integral vertikal (refleksi tanah) * u = Q  -> cek integral lateral analitik
   const analitik = 2 * Q / (Math.sqrt(2 * Math.PI) * u * sz) * Math.exp(-H * H / (2 * sz * sz)); // faktor 2 = pantulan tanah
   cek('Plume: integral lateral = solusi analitik', Math.abs(sum - analitik) / analitik < 0.02, `numerik ${sum.toExponential(3)} vs analitik ${analitik.toExponential(3)}`);
+}
+// 4) Profil vertikal 3D: integral C(z) dz = Q / (sqrt(2 pi) u sy) (tanpa deposisi), dan koreksi terrain.
+{
+  const src = [{ e: 0, n: 0, H: 40, d: 0, vs: 0, Ts: 300, Q: { X: 10 } }];
+  const par = { sumber: src, polutan: 'X', u: 4, dirFrom: 270, cls: 'D', urban: false, kLoss: 0 };
+  const f = airField(par), x = 3000, [sy] = sigma('D', x, false);
+  let sum = 0; for (let z = 0; z <= 3000; z += 2) sum += f.c(x, 0, z, 0) * 1e-6 * 2;
+  const an = 10 / (Math.sqrt(2 * Math.PI) * 4 * sy);
+  cek('Profil vertikal 3D terintegrasi = analitik', Math.abs(sum - an) / an < 0.01, `numerik ${sum.toExponential(3)} vs analitik ${an.toExponential(3)}`);
+  const dem = (e) => e > 2000 ? 60 : 0;      // bukit datar setinggi 60 m di hilir
+  const tinggi = [{ ...src[0], H: 150 }];
+  const a = airField({ ...par, sumber: tinggi, dem, topo: true }), b = airField({ ...par, sumber: tinggi, dem, topo: false });
+  cek('Terrain menaikkan konsentrasi permukaan di bukit', a.c(3000, 0, 0) > b.c(3000, 0, 0) * 1.5, `${a.c(3000, 0, 0).toFixed(1)} vs ${b.c(3000, 0, 0).toFixed(1)} ug/m3`);
 }
 process.exit(gagal ? 1 : 0);
